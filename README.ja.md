@@ -36,7 +36,7 @@ HyperOS を搭載した Xiaomi / Redmi 端末において、非表示・無効�
 3. **Unlock (Backup)** を実行する（設定がバックアップされ、指定スロットの SA が有効化される）。
 4. 元に戻す場合は **Restore** を実行する。
 
-### Windows
+### Windows(未動作確認)
 
 ZIP パッケージを展開し、PowerShell でスクリプトを実行します。
 
