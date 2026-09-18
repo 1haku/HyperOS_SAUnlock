@@ -34,7 +34,7 @@ Ensure Android platform-tools is installed on your PC, enable "USB Debugging" in
 3. Click **Unlock (Backup)** (settings will be backed up, and SA will be enabled on the selected slot).
 4. Click **Restore** to revert to the backed-up state.
 
-### Windows
+### Windows(Not confirmed)
 
 Extract the Windows package and run the script in PowerShell:
 
