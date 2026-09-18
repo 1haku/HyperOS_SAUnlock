@@ -1,0 +1,8 @@
+.DS_Store
+build/
+**/build/
+**/dist/
+backup.json
+recovery.json
+operation.lock
+*.log

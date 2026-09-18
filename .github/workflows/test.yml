@@ -1,0 +1,21 @@
+name: Tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Windows scripts with simulated ADB
+        shell: ${{ matrix.shell }}
+        run: ./windows/tests/Run-Tests.ps1
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test macOS backend with simulated ADB
+        run: bash macos/test.sh
