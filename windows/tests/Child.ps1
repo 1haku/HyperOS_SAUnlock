@@ -1,4 +1,5 @@
-param([string]$Mode, [Parameter(ValueFromRemainingArguments = $true)][string[]]$Values)
+param([string]$Mode)
+$Values = @($args)
 switch ($Mode) {
     'exit' { [Console]::Out.Write('out'); [Console]::Error.Write('err'); exit 7 }
     'flood' {
