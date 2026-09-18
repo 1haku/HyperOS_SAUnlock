@@ -345,8 +345,10 @@ try {
         $values = @('C:\path with spaces\', 'a"b', 'a\"b', 'one&two;three', '$(not-executed)', 'plain')
         $result = [HyperOSSAUnlock.ProcessRunner]::Run($hostExecutable, (@('-NoProfile', '-File', $child, 'args') + $values), 10000)
         Assert-True ($result.Status -eq 0) $result.Stderr
-        $actual = @($result.Stdout | ConvertFrom-Json)
-        Assert-True ($actual.Count -eq $values.Count) 'Argument count changed'
+        # PowerShell 5.1 emits a JSON array as one pipeline object; @(...)
+        # would wrap it in another array. Direct assignment works in both versions.
+        $actual = ConvertFrom-Json -InputObject $result.Stdout
+        Assert-True ($actual.Count -eq $values.Count) "Expected $($values.Count) arguments, got $($actual.Count). Child JSON: $($result.Stdout)"
         for ($i = 0; $i -lt $values.Count; $i++) { Assert-True ($actual[$i] -ceq $values[$i]) "Argument $i changed" }
         Assert-True ([HyperOSSAUnlock.ProcessRunner]::QuoteArgument('') -ceq '""') 'Empty argument escaping failed'
     }
