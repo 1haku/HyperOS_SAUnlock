@@ -117,5 +117,4 @@ open "macos/build/HyperOS_SAUnlock.app"
 * 本ツールの使用による端末の故障、ブートループ、データ消失、契約上のトラブル、その他いかなる損害についても、開発者は一切の責任を負いません。すべて自己責任で使用してください。
 
 ## ライセンス
-
-[MIT License](https://www.google.com/search?q=LICENSE&utm_source=gemini)
+MIT License
