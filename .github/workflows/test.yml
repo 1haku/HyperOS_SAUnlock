@@ -5,13 +5,17 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
       - name: Test Windows scripts with simulated ADB
-        shell: ${{ matrix.shell }}
+        shell: powershell
+        run: ./windows/tests/Run-Tests.ps1
+  windows-pwsh:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Windows scripts with simulated ADB
+        shell: pwsh
         run: ./windows/tests/Run-Tests.ps1
   macos:
     runs-on: macos-14
