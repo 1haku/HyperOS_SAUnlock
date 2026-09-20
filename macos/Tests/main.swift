@@ -42,7 +42,7 @@ final class FakeADB {
             CommandResult(status: 0, stdout: output, stderr: "")
         }
         if args == ["devices"] { return ok("List of devices attached\n" + devices) }
-        guard args.count >= 4, args[0] == "-s", args[1] == "TEST" else {
+        guard args.count >= 4, args[0] == "-s", devices.hasPrefix(args[1] + "\t") else {
             throw TestFailure("Unexpected ADB command: \(args)")
         }
         let command = Array(args.dropFirst(2))
@@ -62,7 +62,7 @@ final class FakeADB {
             settings[slot == dataSlot ? modeKey : dualKey] = value ? "2" : "0"
             return ok()
         }
-        if command.starts(with: ["shell", "getprop"]) { return ok(enabled ? "1" : "0") }
+        if command.starts(with: ["shell", "getprop"]) { return ok(command.last == "persist.security.adbinput" ? "1" : (enabled ? "1" : "0")) }
         if command.count >= 5, command.starts(with: ["shell", "settings"]) {
             let key = command[3] + "/" + command[4]
             switch command[2] {
@@ -87,18 +87,21 @@ final class FakeADB {
 final class Fixture {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sa-unlock-tests-" + UUID().uuidString)
     let adb = FakeADB()
-    var backup: URL { directory.appendingPathComponent("backup.json") }
-    var recovery: URL { directory.appendingPathComponent("recovery.json") }
+    let slot: Int
+    var backup: URL { directory.appendingPathComponent("devices/54455354/slot-\(slot)/backup.json") }
+    var recovery: URL { backup.deletingLastPathComponent().appendingPathComponent("recovery.json") }
     var tool: ADBTool!
 
     init(slot: Int = 0) throws {
+        self.slot = slot
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         tool = try ADBTool(slot: slot, executablePath: "/mock/adb", probeResourceURL: directory.appendingPathComponent("probe.jar"),
-                           backupURL: backup, command: adb.run)
+                           backupURL: directory.appendingPathComponent("backup.json"), command: adb.run)
     }
 
     func saveOriginal(enabled: Bool = false, serial: String = "TEST") throws {
         let data = try JSONSerialization.data(withJSONObject: ["serial": serial, "savedAt": "test", "saEnabled": enabled])
+        try FileManager.default.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: backup)
     }
 
@@ -213,7 +216,10 @@ test("failed automatic rollback remains recoverable after reopening") {
     f.adb.enabled = true
     f.adb.settings = [visibleKey: "7", disabledKey: "8", modeKey: "9"]
     let before = f.adb.settings
-    f.adb.intercept = { args in args.last?.hasSuffix("enable-sa 0") == true ? failure : nil }
+    f.adb.intercept = { args in
+        if args.last?.hasSuffix("enable-sa 0") == true { f.adb.enabled = false; return failure }
+        return nil
+    }
     let message = try expectError("Automatic rollback also failed") { _ = try f.tool.unlockWithBackup() }
     try check(message.contains("Verified:"), "Missing per-item verification")
     try check(f.adb.settings == before, "Binder failure skipped setting restoration")
@@ -221,7 +227,7 @@ test("failed automatic rollback remains recoverable after reopening") {
     try expectError("Click Restore first") { _ = try f.tool.unlockWithBackup() }
     f.adb.intercept = nil
     let reopened = try ADBTool(slot: 0, executablePath: "/mock/adb", probeResourceURL: f.directory.appendingPathComponent("probe.jar"),
-                               backupURL: f.backup, command: f.adb.run)
+                               backupURL: f.directory.appendingPathComponent("backup.json"), command: f.adb.run)
     let status = try reopened.statusSummary()
     try check(status.contains("Recovery pending"), "Pending recovery not displayed")
     _ = try reopened.restore()
@@ -289,6 +295,67 @@ test("backup write failure prevents device changes") {
                            backupURL: notDirectory.appendingPathComponent("backup.json"), command: f.adb.run)
     try expectError("Could not save the backup") { _ = try tool.unlockWithBackup() }
     try check(f.adb.writes.isEmpty, "Wrote to device without a backup")
+}
+
+test("permission preflight explains security debugging without writes or snapshots") {
+    let f = try Fixture()
+    f.adb.intercept = { args in args.last == "persist.security.adbinput" ? CommandResult(status: 0, stdout: "0", stderr: "") : nil }
+    try expectError("USB debugging (Security settings)") { _ = try f.tool.unlockWithBackup() }
+    try check(f.adb.writes.isEmpty && !FileManager.default.fileExists(atPath: f.backup.path), "Permission failure mutated state")
+}
+
+test("permission exception with zero exit status is actionable and rollback skips unchanged values") {
+    let f = try Fixture()
+    f.adb.intercept = { args in
+        if args.contains("put") || args.contains("delete") {
+            return CommandResult(status: 0, stdout: "java.lang.SecurityException: android.permission.WRITE_SETTINGS", stderr: "")
+        }
+        return nil
+    }
+    let message = try expectError("USB debugging (Security settings)") { _ = try f.tool.unlockWithBackup() }
+    try check(message.contains("Restored the state") && !message.contains("rollback also failed"), "False recovery failure")
+    try check(f.adb.writes.count == 1 && !FileManager.default.fileExists(atPath: f.recovery.path), "Unnecessary rollback writes")
+}
+
+test("different device and slot backups coexist with a legacy backup") {
+    let f = try Fixture()
+    let legacy = f.directory.appendingPathComponent("backup.json")
+    try JSONSerialization.data(withJSONObject: ["serial": "OTHER", "savedAt": "old", "saEnabled": false]).write(to: legacy)
+    _ = try f.tool.unlockWithBackup()
+    let first = try Data(contentsOf: f.backup)
+    let second = try ADBTool(slot: 1, executablePath: "/mock/adb", probeResourceURL: f.directory.appendingPathComponent("probe.jar"), backupURL: legacy, command: f.adb.run)
+    _ = try second.unlockWithBackup()
+    let retained = try Data(contentsOf: f.backup)
+    try check(retained == first, "Slot 0 backup overwritten")
+    try check(FileManager.default.fileExists(atPath: f.directory.appendingPathComponent("devices/4f54484552/slot-0/backup.json").path), "Legacy device backup lost")
+    _ = try second.restore()
+    _ = try f.tool.restore()
+    try check(!f.adb.enabled && !f.adb.enabledSlot1 && f.adb.settings.isEmpty, "Reverse slot restore failed")
+}
+
+test("pending recovery blocks the other slot on the same phone only") {
+    let f = try Fixture()
+    try f.saveOriginal()
+    try FileManager.default.copyItem(at: f.backup, to: f.recovery)
+    let second = try ADBTool(slot: 1, executablePath: "/mock/adb", probeResourceURL: f.directory.appendingPathComponent("probe.jar"), backupURL: f.directory.appendingPathComponent("backup.json"), command: f.adb.run)
+    try expectError("pending recovery on this phone") { _ = try second.unlockWithBackup() }
+    try check(f.adb.writes.isEmpty, "Other slot modified during recovery")
+    f.adb.devices = "OTHER\tdevice\n"
+    _ = try second.unlockWithBackup()
+}
+
+test("switching connected phones selects independent backups") {
+    let f = try Fixture()
+    _ = try f.tool.unlockWithBackup()
+    let first = try Data(contentsOf: f.backup)
+    f.adb.devices = "OTHER\tdevice\n"
+    f.adb.enabled = false
+    f.adb.settings = [:]
+    _ = try f.tool.unlockWithBackup()
+    _ = try f.tool.restore()
+    try check(!f.adb.enabled && f.adb.settings.isEmpty, "Other device restore failed")
+    let retained = try Data(contentsOf: f.backup)
+    try check(first == retained, "First device backup overwritten")
 }
 
 test("another device's backup blocks unlock and restore") {

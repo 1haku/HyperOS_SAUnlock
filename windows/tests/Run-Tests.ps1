@@ -50,7 +50,7 @@ function New-Fixture {
             $result.Stdout = "List of devices attached`n" + $this.Devices
             return $result
         }
-        if ($Arguments.Count -lt 4 -or $Arguments[0] -ne '-s' -or $Arguments[1] -ne 'TEST') {
+        if ($Arguments.Count -lt 4 -or $Arguments[0] -ne '-s' -or -not $this.Devices.StartsWith($Arguments[1] + "`t")) {
             throw "Unexpected fake command: $Arguments"
         }
         if ($Arguments[2] -eq 'push') { return $result }
@@ -92,12 +92,13 @@ function New-Fixture {
     $context = New-SAUnlockContext -Slot $Slot -AdbPath '/mock/adb' -BackupDirectory $directory -ProbePath $probe -Runner $runner
     [pscustomobject]@{
         Context = $context; Fake = $fake; Directory = $directory
-        Backup = (Join-Path $directory 'backup.json'); Recovery = (Join-Path $directory 'recovery.json')
+        Backup = (Join-Path $directory "devices/54455354/slot-$Slot/backup.json"); Recovery = (Join-Path $directory "devices/54455354/slot-$Slot/recovery.json")
     }
 }
 function Write-Original {
     param($Fixture, [bool]$Enabled = $false, [string]$Serial = 'TEST')
     $json = @{ serial = $Serial; savedAt = 'test'; saEnabled = $Enabled } | ConvertTo-Json
+    $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Fixture.Backup))
     [IO.File]::WriteAllText($Fixture.Backup, $json)
 }
 function Fail-Command {
@@ -183,6 +184,57 @@ try {
         Assert-True ($f.Fake.Settings['system/5g_network_mode_selection_visiable'] -eq '7') 'Visibility not restored'
         Assert-True ([IO.File]::ReadAllText($f.Backup) -ceq $original) 'Original backup overwritten'
     }
+    Test-Case 'permission preflight stops before snapshots and writes' {
+        $f = New-Fixture
+        $f.Fake.Override = { param($fake, $arguments)
+            if ($arguments[-1] -eq 'persist.security.adbinput') { [pscustomobject]@{ Status = 0; Stdout = '0'; Stderr = ''; Truncated = $false } }
+        }
+        $null = Assert-Fails { Invoke-SAUnlockOperation $f.Context enable } 'USB debugging \(Security settings\)'
+        Assert-True ($f.Fake.Writes -eq 0 -and -not (Test-Path $f.Backup)) 'Permission check changed state'
+    }
+    Test-Case 'permission exception leaves unchanged state without false recovery failure' {
+        $f = New-Fixture
+        $f.Fake.Override = { param($fake, $arguments)
+            if ($arguments -contains 'put' -or $arguments -contains 'delete') { [pscustomobject]@{ Status = 0; Stdout = 'java.lang.SecurityException: android.permission.WRITE_SETTINGS'; Stderr = ''; Truncated = $false } }
+        }
+        $message = Assert-Fails { Invoke-SAUnlockOperation $f.Context enable } 'USB debugging \(Security settings\)'
+        Assert-True ($message.Contains('Restored the state') -and -not (Test-Path $f.Recovery)) 'False recovery failure'
+    }
+    Test-Case 'pending recovery blocks the other slot on the same phone only' {
+        $f = New-Fixture
+        Write-Original $f
+        Copy-Item $f.Backup $f.Recovery
+        $other = New-SAUnlockContext -Slot 1 -AdbPath '/mock/adb' -BackupDirectory $f.Directory -ProbePath $f.Context.ProbePath -Runner $f.Context.Runner
+        $null = Assert-Fails { Invoke-SAUnlockOperation $other enable } 'pending recovery on this phone'
+        Assert-True ($f.Fake.Writes -eq 0) 'Other slot changed during recovery'
+        $f.Fake.Devices = "OTHER`tdevice`n"
+        $null = Invoke-SAUnlockOperation $other enable
+    }
+    Test-Case 'switching phones selects independent backups' {
+        $f = New-Fixture
+        $null = Invoke-SAUnlockOperation $f.Context enable
+        $first = [IO.File]::ReadAllText($f.Backup)
+        $f.Fake.Devices = "OTHER`tdevice`n"
+        $f.Fake.Enabled = $false
+        $f.Fake.Settings = @{}
+        $null = Invoke-SAUnlockOperation $f.Context enable
+        $null = Invoke-SAUnlockOperation $f.Context restore
+        Assert-True (-not $f.Fake.Enabled -and $f.Fake.Settings.Count -eq 0) 'Other device restore failed'
+        Assert-True ([IO.File]::ReadAllText($f.Backup) -ceq $first) 'First device backup overwritten'
+    }
+    Test-Case 'device and slot backups coexist and preserve a legacy device' {
+        $f = New-Fixture
+        [IO.File]::WriteAllText((Join-Path $f.Directory 'backup.json'), (@{serial='OTHER';savedAt='old';saEnabled=$false} | ConvertTo-Json))
+        $null = Invoke-SAUnlockOperation $f.Context enable
+        $first = [IO.File]::ReadAllText($f.Backup)
+        $other = New-SAUnlockContext -Slot 1 -AdbPath '/mock/adb' -BackupDirectory $f.Directory -ProbePath $f.Context.ProbePath -Runner $f.Context.Runner
+        $null = Invoke-SAUnlockOperation $other enable
+        Assert-True ([IO.File]::ReadAllText($f.Backup) -ceq $first) 'Original slot overwritten'
+        Assert-True (Test-Path (Join-Path $f.Directory 'devices/4f54484552/slot-0/backup.json')) 'Legacy backup lost'
+        $null = Invoke-SAUnlockOperation $other restore
+        $null = Invoke-SAUnlockOperation $f.Context restore
+        Assert-True (-not $f.Fake.Enabled -and -not $f.Fake.EnabledSlot1 -and $f.Fake.Settings.Count -eq 0) 'Reverse restore failed'
+    }
     Test-Case 'partial rollback survives reopening and blocks further unlocks' {
         $f = New-Fixture
         Write-Original $f
@@ -190,7 +242,7 @@ try {
         $f.Fake.Settings['global/fiveg_network_mode'] = '2'
         $f.Fake.Override = {
             param($fake, $arguments)
-            if ($arguments[-1].EndsWith('enable-sa 0')) { Fail-Command }
+            if ($arguments[-1].EndsWith('enable-sa 0')) { $fake.Enabled = $false; Fail-Command }
         }
         $null = Assert-Fails { Invoke-SAUnlockOperation $f.Context enable } 'Automatic rollback also failed'
         Assert-True ((Test-Path $f.Recovery) -and $f.Fake.Settings.Count -eq 1) 'Recovery lost or remaining settings not restored'
@@ -293,7 +345,7 @@ try {
     foreach ($json in @('{broken', '{"serial":"TEST","savedAt":"test","saEnabled":"false"}',
                         '{"serial":"TEST","savedAt":"test","saEnabled":false,"visible":"1; reboot"}')) {
         Test-Case 'damaged or malicious backup is rejected before writes' {
-            $f = New-Fixture; [IO.File]::WriteAllText($f.Backup, $json)
+            $f = New-Fixture; $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($f.Backup)); [IO.File]::WriteAllText($f.Backup, $json)
             $null = Assert-Fails { Invoke-SAUnlockOperation $f.Context restore } 'Could not read backup'
             Assert-True ($f.Fake.Writes -eq 0) 'Invalid backup executed'
         }

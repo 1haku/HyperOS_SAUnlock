@@ -51,20 +51,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\HyperOSSAUnlock.ps1
 * `[3]` 復元（Restore）
 * `[0]` 終了
 
-※Windows PowerShell 5.1 または PowerShell 7 が必要です。詳細は [Windows ドキュメント](https://www.google.com/search?q=windows/README.ja.md&utm_source=gemini) を参照してください。
+※Windows PowerShell 5.1 または PowerShell 7 が必要です。詳細は [Windows ドキュメント](windows/README.ja.md) を参照してください。
 
 ## バックアップ
 
 バックアップファイルは各 OS の以下に保存されます。
 
-* **macOS**: `~/Library/Application Support/HyperOSSAUnlock/backup.json`
-* **Windows**: `%LocalAppData%\HyperOSSAUnlock\backup.json`
+* **macOS**: `~/Library/Application Support/HyperOSSAUnlock/devices/<device-id>/slot-<0-or-1>/backup.json`
+* **Windows**: `%LocalAppData%\HyperOSSAUnlock\devices\<device-id>\slot-<0-or-1>\backup.json`
 
 選択スロット、Android Settings の値（`dual_sa_enabled` を含む）、SA スイッチの状態、端末シリアル番号を保存します。既存の `backup.json` は上書きされず、シリアル番号やスロットが一致しない端末への復元は拒否されます（スロット情報のない旧バックアップは slot 0 として処理）。
 
-有効化処理ごとに直前状態を `recovery.json` へ一時保存します。処理の中断や異常終了が発生した場合は、次回 **Restore** 実行時に直前状態への復旧が優先されます。
+バックアップは端末・スロットごとに保存され、対象を切り替えると自動的に選ばれます。ID はシリアル番号の UTF-8 バイト列を16進数にしたもので、同じ機種の端末も区別できます。機種名もファイル内に保存します。従来の単一ファイルは対応するフォルダーへ移動し、既存ファイルは上書きしません。
 
-※別のスロットを操作する場合は、事前に現在のスロットを **Restore** で復元した上で、`backup.json` を別の場所へ退避してください。
+有効化処理ごとに直前状態を、元のバックアップと同じフォルダーの `recovery.json` へ一時保存します。処理の中断や異常終了が発生した場合は、次回 **Restore** 実行時に直前状態への復旧が優先されます。
+
+※Settings 値はスロット間で共有されます。同じ端末で両方のスロットを有効化した場合は、操作と逆の順序で復元し、SIM の構成とデータ通信用 SIM は変更しないでください。未完了の復旧がある場合は、そのスロットで復旧を済ませてから同じ端末の設定を変更してください。別の端末は引き続き操作できます。
 
 ## 仕組み
 
@@ -107,6 +109,7 @@ open "macos/build/HyperOS_SAUnlock.app"
 
 ## トラブルシューティング
 
+* **設定の書き込み権限がない**: 開発者向けオプションの **USB デバッグ（セキュリティ設定）** を有効にしてください。通常の USB デバッグとは別のスイッチです。復旧時は値が一致する項目への書き込みを省き、全項目の読み戻し結果が一致した場合に復旧完了と判定します。
 * **端末が認識されない**: ターミナルで `adb devices` を実行して接続を確認し、端末の画面ロックを解除して USB デバッグを許可してください。
 * **ADB が見つからない**: platform-tools のパスを `PATH` に通すか、`ANDROID_HOME` を設定してください。
 * **Network mode が `Unknown` になる**: 一部ファームウェアで取得 API が省略されている仕様です。SA スイッチ自体の状態は「SA user switch」の値で確認してください。

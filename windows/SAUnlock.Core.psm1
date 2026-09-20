@@ -1,6 +1,7 @@
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:PermissionHint = 'Settings access was denied. On the phone, open Settings > Additional settings > Developer options and enable USB debugging (Security settings), then retry. This is separate from USB debugging.'
 
 if (-not ('HyperOSSAUnlock.ProcessRunner' -as [type])) {
     Add-Type -Path (Join-Path $PSScriptRoot 'ProcessRunner.cs')
@@ -57,6 +58,8 @@ function Invoke-SAUnlockADB {
     if ($Context.Runner) { $result = & $Context.Runner $Arguments }
     else { $result = [HyperOSSAUnlock.ProcessRunner]::Run($Context.AdbPath, $Arguments, 30000) }
     if ($result.Truncated) { throw 'ADB output exceeded the capture limit; the result cannot be verified.' }
+    if (("$($result.Stdout)`n$($result.Stderr)" -match 'SecurityException') -and
+        ("$($result.Stdout)`n$($result.Stderr)" -match 'WRITE_SETTINGS|WRITE_SECURE_SETTINGS')) { throw $script:PermissionHint }
     if ($result.Status -ne 0) {
         throw "ADB command failed (exit code $($result.Status)):`n$($result.Stdout)`n$($result.Stderr)"
     }
@@ -218,7 +221,11 @@ function Restore-SAUnlockCore {
     $errors = New-Object 'Collections.Generic.List[string]'
     $verified = New-Object 'Collections.Generic.List[string]'
     $action = if ($Backup.saEnabled) { 'enable-sa' } else { 'disable-sa' }
-    try { $null = Invoke-SAUnlockProbe $Context $Serial $action }
+    try {
+        $matches = $false
+        try { $matches = (Get-SAUnlockProbeState $Context $Serial).Enabled -eq $Backup.saEnabled } catch { }
+        if (-not $matches) { $null = Invoke-SAUnlockProbe $Context $Serial $action }
+    }
     catch { $errors.Add("SA write: $($_.Exception.Message)") }
     $settings = @(
         @('system', '5g_network_mode_selection_visiable', $Backup.visible),
@@ -227,7 +234,11 @@ function Restore-SAUnlockCore {
     )
     if ($Backup.formatVersion -eq 2) { $settings += ,@('global', 'dual_sa_enabled', $Backup.dualSaEnabled) }
     foreach ($item in $settings) {
-        try { Set-SAUnlockSetting $Context $Serial $item[0] $item[1] $item[2] }
+        try {
+            $matches = $false
+            try { $matches = (Get-SAUnlockSetting $Context $Serial $item[0] $item[1]) -ceq $item[2] } catch { }
+            if (-not $matches) { Set-SAUnlockSetting $Context $Serial $item[0] $item[1] $item[2] }
+        }
         catch { $errors.Add("$($item[1]) write: $($_.Exception.Message)") }
     }
     try {
@@ -242,13 +253,19 @@ function Restore-SAUnlockCore {
             $verified.Add($item[1])
         } catch { $errors.Add("$($item[1]) verification: $($_.Exception.Message)") }
     }
-    if ($errors.Count) { throw "Restore incomplete.`nVerified: $($verified -join ', ')`n$($errors -join "`n")" }
+    if ($verified.Count -ne $settings.Count + 1) { throw "Restore incomplete.`nVerified: $($verified -join ', ')`n$($errors -join "`n")" }
 }
 
 function Format-SAUnlockValue {
     param($Value)
     if ($null -eq $Value) { return 'unset' }
     return [string]$Value
+}
+
+function Get-SAUnlockBackupPath {
+    param($Context, [string]$Serial, [int]$Slot, [string]$Name)
+    $id = ([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($Serial))).Replace('-', '').ToLowerInvariant()
+    Join-Path $Context.BackupDirectory "devices/$id/slot-$Slot/$Name"
 }
 
 function Invoke-SAUnlockOperation {
@@ -260,8 +277,22 @@ function Invoke-SAUnlockOperation {
     } catch { throw "Cannot lock the backup directory. Another instance may be running: $($_.Exception.Message)" }
     try {
         $serial = Get-SAUnlockDevice $Context
-        $backupPath = Join-Path $Context.BackupDirectory 'backup.json'
-        $recoveryPath = Join-Path $Context.BackupDirectory 'recovery.json'
+        foreach ($name in @('backup.json', 'recovery.json')) {
+            $old = Join-Path $Context.BackupDirectory $name
+            $saved = Read-SAUnlockBackup $old
+            if ($null -ne $saved) {
+                $destination = Get-SAUnlockBackupPath $Context $saved.serial $saved.slot $name
+                if (Test-Path -LiteralPath $destination) { throw "Both legacy and device-specific backups exist. Keep both and resolve the duplicate: $old" }
+                $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
+                [IO.File]::Move($old, $destination)
+            }
+        }
+        $backupPath = Get-SAUnlockBackupPath $Context $serial $Context.Slot 'backup.json'
+        $recoveryPath = Get-SAUnlockBackupPath $Context $serial $Context.Slot 'recovery.json'
+        $otherRecovery = Get-SAUnlockBackupPath $Context $serial (1 - $Context.Slot) 'recovery.json'
+        if ($Action -ne 'status' -and (Test-Path -LiteralPath $otherRecovery)) {
+            throw "SIM $(2 - $Context.Slot) has a pending recovery on this phone. Select that slot and choose Restore first; some settings are shared by both slots."
+        }
         $pending = Test-Path -LiteralPath $recoveryPath
         if ($Action -eq 'restore') {
             $path = if ($pending) { $recoveryPath } else { $backupPath }
@@ -281,6 +312,10 @@ function Invoke-SAUnlockOperation {
             throw 'The backup belongs to another device. Move it somewhere safe before backing up this phone.'
         }
         if ($Action -eq 'enable' -and $null -ne $original) { Assert-SAUnlockBackupSlot $Context $original }
+        if ($Action -eq 'enable') {
+            $access = Invoke-SAUnlockADB $Context @('-s', $serial, 'shell', 'getprop', 'persist.security.adbinput')
+            if ($access.Trim() -eq '0') { throw $script:PermissionHint }
+        }
         Copy-SAUnlockProbe $Context $serial
         $before = Get-SAUnlockState $Context $serial
         if ($Action -eq 'status') {
@@ -289,7 +324,7 @@ function Invoke-SAUnlockOperation {
             $backupLabel = if ($null -eq $original) { 'none' } else { $original.savedAt }
             $mode = if ($null -eq $before.networkMode) { 'Unknown' } else { $before.networkMode }
             $summary = @(
-                "Device: $shortSerial", "Target: SIM $($Context.Slot + 1) (slot $($Context.Slot))", "SA user switch: $($before.saEnabled)",
+                "Device: $((Invoke-SAUnlockADB $Context @('-s', $serial, 'shell', 'getprop', 'ro.product.model')).Trim()) ($shortSerial)", "Target: SIM $($Context.Slot + 1) (slot $($Context.Slot))", "SA user switch: $($before.saEnabled)",
                 "SA network mode: $mode", "Visibility setting: $(Format-SAUnlockValue $before.visible)",
                 "SA disabled setting: $(Format-SAUnlockValue $before.saDisabled)",
                 "fiveg_network_mode: $(Format-SAUnlockValue $before.fiveGNetworkMode)",
@@ -300,7 +335,7 @@ function Invoke-SAUnlockOperation {
             return $summary -join "`n"
         }
         $snapshot = [pscustomobject][ordered]@{
-            serial = $serial; savedAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            deviceName = (Invoke-SAUnlockADB $Context @('-s', $serial, 'shell', 'getprop', 'ro.product.model')).Trim(); serial = $serial; savedAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
             visible = $before.visible; saDisabled = $before.saDisabled
             fiveGNetworkMode = $before.fiveGNetworkMode; saEnabled = $before.saEnabled
             formatVersion = 2; slot = $Context.Slot; dualSaEnabled = $before.dualSaEnabled

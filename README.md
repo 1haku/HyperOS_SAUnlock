@@ -49,20 +49,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\HyperOSSAUnlock.ps1
 * `[3]` Restore
 * `[0]` Exit
 
-*Requires Windows PowerShell 5.1 or PowerShell 7. See the [Windows documentation](https://www.google.com/search?q=windows/README.md&utm_source=gemini) for details.*
+*Requires Windows PowerShell 5.1 or PowerShell 7. See the [Windows documentation](windows/README.md) for details.*
 
 ## Backup & Safety
 
 Backup files are stored locally:
 
-* **macOS**: `~/Library/Application Support/HyperOSSAUnlock/backup.json`
-* **Windows**: `%LocalAppData%\HyperOSSAUnlock\backup.json`
+* **macOS**: `~/Library/Application Support/HyperOSSAUnlock/devices/<device-id>/slot-<0-or-1>/backup.json`
+* **Windows**: `%LocalAppData%\HyperOSSAUnlock\devices\<device-id>\slot-<0-or-1>\backup.json`
 
 Stores the selected slot, target Android Settings values (including `dual_sa_enabled`), the SA switch state, and the device serial number. Existing `backup.json` files are never overwritten, and restoring is rejected if the serial number or slot does not match (legacy backups without slot metadata default to slot 0).
 
-Before each operation, state snapshots are saved to `recovery.json`. If an operation fails or is interrupted, the next **Restore** automatically prioritizes rolling back to this immediate pre-operation state.
+Each device and slot has its own backup, selected automatically when you switch targets. The device ID is the serial number encoded as UTF-8 hexadecimal, so phones with the same model name remain distinct. The model name is also saved in the backup. Existing single-file backups are moved to the matching folder without overwriting files.
 
-*Note: To modify a different slot, restore the current slot first, then move `backup.json` to a safe location before unlocking the other slot.*
+Before each unlock, state snapshots are saved to `recovery.json` beside the original backup. If an operation fails or is interrupted, the next **Restore** automatically prioritizes rolling back to this immediate pre-operation state.
+
+*Note: Settings are shared across slots. If you unlock both slots on one phone, restore them in reverse order and keep the same SIM configuration and default data SIM. A pending recovery must be completed on its original slot before changing either slot on that phone; other phones remain usable.*
 
 ## How It Works
 
@@ -105,6 +107,7 @@ open "macos/build/HyperOS_SAUnlock.app"
 
 ## Troubleshooting
 
+* **Settings access denied**: Enable **USB debugging (Security settings)** in Developer Options; this is separate from ordinary USB debugging. During recovery, values that already match are not rewritten. Recovery succeeds only when all saved values read back correctly.
 * **Device not found**: Run `adb devices` in your terminal to verify the connection. Unlock the screen and accept the USB debugging authorization prompt.
 * **ADB not found**: Ensure `platform-tools` is in your `PATH` or set `ANDROID_HOME`.
 * **Network mode shows "Unknown"**: Expected on firmware builds where the query API is omitted. Check the "SA user switch" value to verify the toggle state.

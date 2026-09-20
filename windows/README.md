@@ -45,11 +45,13 @@ Commands are also available without the menu. These examples target SIM 2; use `
 
 The default directory is `%LocalAppData%\HyperOSSAUnlock`. `-BackupDirectory` can select another directory. Keep using the same directory when restoring.
 
+Each device and slot uses `devices/<device-id>/slot-<0-or-1>/` under that directory. The device ID is the hexadecimal UTF-8 serial; the model name is stored inside the backup. Legacy files are moved to their matching folder.
+
 - `backup.json` preserves the original settings and is never overwritten.
 - `recovery.json` holds the state immediately before an unlock attempt. If automatic rollback fails or the process is interrupted, choose **Restore** to recover that attempt first. A second restore returns to the original backup.
 - `operation.lock` prevents two copies using the same backup directory at once. The file may remain after exit; the lock is released when the process closes.
 
-Restoration checks the device serial number and slot, attempts every saved setting, and reports failures. Older backups are treated as slot 0. Before using another slot, restore the previous one and move its original backup somewhere safe, or use a separate `-BackupDirectory`. Settings values apply across the phone: restore overlapping backups in reverse order and keep the same SIM configuration and default data SIM. A missing original setting is restored by deleting its key. The backup format matches the macOS app, but files are not synchronized between computers. Do not publish these files: they contain the device serial number.
+Restoration checks the device serial number and slot, attempts every saved setting, and reports failures. Older backups are treated as slot 0. Switching devices or slots automatically selects its own backup. Settings values apply across the phone: restore overlapping backups in reverse order and keep the same SIM configuration and default data SIM. A missing original setting is restored by deleting its key. The backup format matches the macOS app, but files are not synchronized between computers. Do not publish these files: they contain the device serial number.
 
 ## Build and test
 
@@ -70,3 +72,5 @@ Tests use a simulated ADB device and temporary backup directories:
 ```
 
 For the phone-side method, tested devices, and project disclaimer, see the repository's main README. Windows USB operation still requires testing on a Windows host; a passing simulated-device test is not a real-device verification.
+
+If Settings access is denied, enable **USB debugging (Security settings)** on the phone. Ordinary USB debugging alone may not allow Settings writes.

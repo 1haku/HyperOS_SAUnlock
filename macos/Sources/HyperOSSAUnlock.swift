@@ -60,6 +60,7 @@ private struct Backup: Codable {
     let formatVersion: Int?
     let slot: Int?
     let dualSaEnabled: String?
+    var deviceName: String? = nil
 
     var targetSlot: Int { slot ?? 0 }
 }
@@ -68,7 +69,8 @@ final class ADBTool {
     private let executablePath: String
     private let probeResourceURL: URL
 
-    private let backupFileURL: URL
+    private let legacyBackupURL: URL
+    private var selectedBackupURL: URL?
     private let execute: ([String]) throws -> CommandResult
     private let slot: Int
 
@@ -85,7 +87,7 @@ final class ADBTool {
         }
         self.executablePath = path
         self.probeResourceURL = probe
-        self.backupFileURL = backupURL ?? FileManager.default.urls(
+        self.legacyBackupURL = backupURL ?? FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("HyperOSSAUnlock", isDirectory: true)
             .appendingPathComponent("backup.json")
@@ -98,14 +100,46 @@ final class ADBTool {
         executablePath
     }
 
-    var backupURL: URL { backupFileURL }
+    var backupURL: URL { selectedBackupURL ?? legacyBackupURL }
+
+    private static let permissionHint = "Settings access was denied. On the phone, open Settings > Additional settings > Developer options and enable USB debugging (Security settings), then retry. This is separate from USB debugging."
+
+    private func selectBackup(for serial: String) throws {
+        let root = legacyBackupURL.deletingLastPathComponent()
+        func target(_ serial: String, _ slot: Int, _ name: String) -> URL {
+            let id = serial.utf8.map { String(format: "%02x", $0) }.joined()
+            return root.appendingPathComponent("devices/\(id)/slot-\(slot)/\(name)")
+        }
+        // Move old single-device files using their own identity, never the connected phone's.
+        for name in ["backup.json", "recovery.json"] {
+            let old = root.appendingPathComponent(name)
+            if let saved = try loadBackup(from: old) {
+                let destination = target(saved.serial, saved.targetSlot, name)
+                guard !FileManager.default.fileExists(atPath: destination.path) else {
+                    throw ToolError.message("Both legacy and device-specific backups exist. Keep both files and resolve the duplicate before continuing: \(old.path)")
+                }
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: old, to: destination)
+            }
+        }
+        selectedBackupURL = target(serial, slot, "backup.json")
+    }
 
     private var recoveryURL: URL {
         backupURL.deletingLastPathComponent().appendingPathComponent("recovery.json")
     }
 
+    private func requireNoOtherSlotRecovery() throws {
+        let other = backupURL.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("slot-\(1 - slot)/recovery.json")
+        if FileManager.default.fileExists(atPath: other.path) {
+            throw ToolError.message("SIM \(2 - slot) has a pending recovery on this phone. Select that slot and click Restore first; some settings are shared by both slots.")
+        }
+    }
+
     func statusSummary() throws -> String {
         let device = try requireDevice()
+        try selectBackup(for: device.serial)
         try pushProbe(to: device.serial)
         let state = try readState(from: device.serial)
         let backupMessage: String
@@ -116,7 +150,8 @@ final class ADBTool {
         }
         let recoveryMessage = FileManager.default.fileExists(atPath: recoveryURL.path)
             ? "\nRecovery pending. Restore will recover the last operation." : ""
-        return "Device: \(shortSerial(device.serial))\n" +
+        let model = try getProperty("ro.product.model", on: device.serial) ?? "Android"
+        return "Device: \(model) (\(shortSerial(device.serial)))\n" +
             "Target: SIM \(slot + 1) (slot \(slot))\n" +
             "SA user switch: \(state.saEnabled ? "Enabled" : "Disabled")\n" +
             "SA network mode: \(state.networkMode ?? "Unknown")\n" +
@@ -130,8 +165,13 @@ final class ADBTool {
 
     func unlockWithBackup() throws -> String {
         let device = try requireDevice()
+        try selectBackup(for: device.serial)
+        try requireNoOtherSlotRecovery()
         guard !FileManager.default.fileExists(atPath: recoveryURL.path) else {
             throw ToolError.message("A previous operation needs recovery. Click Restore first.")
+        }
+        if try getProperty("persist.security.adbinput", on: device.serial) == "0" {
+            throw ToolError.message(Self.permissionHint)
         }
         try pushProbe(to: device.serial)
         let before = try readState(from: device.serial)
@@ -151,7 +191,8 @@ final class ADBTool {
             saEnabled: before.saEnabled,
             formatVersion: 2,
             slot: slot,
-            dualSaEnabled: before.dualSaEnabled
+            dualSaEnabled: before.dualSaEnabled,
+            deviceName: try getProperty("ro.product.model", on: device.serial)
         )
         if existingBackup == nil {
             try saveBackup(snapshot, to: backupURL)
@@ -188,6 +229,8 @@ final class ADBTool {
 
     func restore() throws -> String {
         let device = try requireDevice()
+        try selectBackup(for: device.serial)
+        try requireNoOtherSlotRecovery()
         let pendingRecovery = FileManager.default.fileExists(atPath: recoveryURL.path)
         guard let backup = try loadBackup(from: pendingRecovery ? recoveryURL : backupURL) else {
             throw ToolError.message("No backup is available. Click Unlock (Backup) first.")
@@ -219,7 +262,9 @@ final class ADBTool {
 
         let action = backup.saEnabled ? "enable-sa" : "disable-sa"
         attempt("SA user switch write") {
-            try runProbe(action: action, on: serial)
+            if (try? readProbeState(on: serial).saEnabled) != backup.saEnabled {
+                try runProbe(action: action, on: serial)
+            }
         }
         var settings: [(String, String, String?)] = [
             ("system", "5g_network_mode_selection_visiable", backup.visible),
@@ -231,7 +276,10 @@ final class ADBTool {
         }
         for (scope, key, value) in settings {
             attempt("\(scope)/\(key) write") {
-                try putSetting(scope: scope, key: key, value: value, on: serial)
+                var matches = false
+                do { matches = try getSetting(scope: scope, key: key, on: serial) == value }
+                catch { /* The write and final verification below still run. */ }
+                if !matches { try putSetting(scope: scope, key: key, value: value, on: serial) }
             }
         }
 
@@ -252,7 +300,7 @@ final class ADBTool {
                 verified.append("\(scope)/\(key)")
             }
         }
-        if !errors.isEmpty {
+        if verified.count != settings.count + 1 {
             throw ToolError.message("Restore incomplete.\nVerified: \(verified.isEmpty ? "none" : verified.joined(separator: ", "))\n" +
                                     errors.joined(separator: "\n"))
         }
@@ -348,6 +396,10 @@ final class ADBTool {
             arguments = ["shell", "settings", "delete", scope, key]
         }
         let result = try runOnDevice(serial, arguments)
+        if result.output.contains("SecurityException") &&
+            (result.output.contains("WRITE_SETTINGS") || result.output.contains("WRITE_SECURE_SETTINGS")) {
+            throw ToolError.message(Self.permissionHint)
+        }
         guard result.status == 0 else {
             let operation = value == nil ? "delete" : "write"
             throw ToolError.message("Could not \(operation) \(scope)/\(key):\n\(result.output)")
